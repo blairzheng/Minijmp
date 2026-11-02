@@ -1,0 +1,164 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt numpy==1.26.4 pandas==2.2.3 scipy==1.14.1 matplotlib==3.9.2 statsmodels==0.14.4 seaborn==0.13.2 "pyinstaller>=6.11,<7" openpyxl xlrd
+          python -m pip check
+
+      - name: Build portable Windows application
+        shell: python
+        run: |
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import textwrap
+
+          launcher = textwrap.dedent(r'''
+          import os
+          import sys
+          import traceback
+          from pathlib import Path
+
+          def run():
+              bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+              os.chdir(bundle_dir / "code")
+              if sys.stdout is None:
+                  sys.stdout = open(os.devnull, "w")
+              if sys.stderr is None:
+                  sys.stderr = sys.stdout
+
+              from MiniJMP import Minijmp, main
+
+              if "--smoke-test" in sys.argv:
+                  import json
+                  import tempfile
+                  import tkinter as tk
+                  import pandas as pd
+                  import openpyxl
+                  import xlrd
+                  from PIL import Image, ImageTk
+                  from matplotlib.figure import Figure
+                  from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+                  from sb_boxplot import single_boxplot
+                  from sb_misc import dot_plot
+
+                  with open("help.json", encoding="utf-8") as source:
+                      json.load(source)
+                  with tempfile.TemporaryDirectory() as folder:
+                      path = Path(folder) / "test.xlsx"
+                      frame = pd.DataFrame({"value": [1.0, 2.0, 3.0]})
+                      frame.to_excel(path, index=False, engine="openpyxl")
+                      pd.testing.assert_frame_equal(frame, pd.read_excel(path), check_dtype=False)
+
+                  root = tk.Tk()
+                  icon = ImageTk.PhotoImage(Image.open("icon.png"), master=root)
+                  root.iconphoto(True, icon)
+                  app = Minijmp(root)
+                  figure = Figure()
+                  axis = figure.add_subplot(121)
+                  single_boxplot(data=frame, y="value", ax=axis)
+                  axis = figure.add_subplot(122)
+                  dot_plot(data=frame, x="value", y="value", ax=axis)
+                  canvas = FigureCanvasTkAgg(figure, master=root)
+                  canvas.draw()
+                  root.update_idletasks()
+                  root.after(250, root.destroy)
+                  root.mainloop()
+                  return
+
+              main()
+
+          if __name__ == "__main__":
+              try:
+                  run()
+              except Exception:
+                  log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Minijmp"
+                  log_dir.mkdir(parents=True, exist_ok=True)
+                  (log_dir / "startup-error.log").write_text(traceback.format_exc(), encoding="utf-8")
+                  sys.exit(1)
+          ''').lstrip()
+          Path("windows_launcher.py").write_text(launcher, encoding="utf-8")
+
+          subprocess.run([
+              sys.executable, "-m", "PyInstaller",
+              "--noconfirm", "--clean", "--onedir", "--windowed",
+              "--name", "Minijmp",
+              "--paths", "code",
+              "--add-data", "code/icon.png;code",
+              "--add-data", "code/help.json;code",
+              "--add-data", "sample_data;sample_data",
+              "--collect-all", "scipy",
+              "--collect-all", "statsmodels",
+              "--collect-all", "seaborn",
+              "--collect-all", "openpyxl",
+              "--hidden-import", "xlrd",
+              "--hidden-import", "matplotlib.backends.backend_tkagg",
+              "windows_launcher.py",
+          ], check=True)
+
+          output = Path("dist/Minijmp")
+          for name in ("LICENSE", "README.md"):
+              shutil.copy2(name, output / name)
+          subprocess.run([
+              "git", "archive", "--format=zip",
+              "--output=dist/Minijmp/source.zip", "HEAD",
+          ], check=True)
+          (output / "README-Windows.txt").write_text(
+              "Extract the entire archive before opening Minijmp.exe.\n"
+              "Keep Minijmp.exe and the _internal directory together.\n"
+              "Python is included. No separate Python installation is required.\n"
+              "Startup errors: %LOCALAPPDATA%\\Minijmp\\startup-error.log\n",
+              encoding="utf-8",
+          )
+          versions = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
+          (output / "dependency-versions.txt").write_text(versions, encoding="utf-8")
+
+      - name: Verify packaged application
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+
+          executable = Path("dist/Minijmp/Minijmp.exe").resolve()
+          try:
+              subprocess.run([str(executable), "--smoke-test"], check=True, timeout=120)
+          except Exception:
+              log = Path(os.environ["LOCALAPPDATA"]) / "Minijmp/startup-error.log"
+              if log.exists():
+                  print(log.read_text(encoding="utf-8"))
+              raise
+
+      - name: Upload Windows download
+        uses: actions/upload-artifact@v4
+        with:
+          name: Minijmp-Windows-x64
+          path: dist/Minijmp/
+          if-no-files-found: error
+          retention-days: 14
