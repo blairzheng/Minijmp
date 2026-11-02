@@ -1,28 +1,38 @@
-name: Build Windows EXE
+name: Build macOS App
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths:
+      - ".github/workflows/build-macos.yml"
+      - "code/**"
+      - "sample_data/**"
+      - "requirements.txt"
 
 permissions:
   contents: read
 
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: macos-15
     timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          architecture: x64
-          cache: pip
+      - name: Set up Python and Tk
+        run: |
+          brew install python@3.11 python-tk@3.11
+          "$(brew --prefix python@3.11)/bin/python3.11" -m venv .venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Python and architecture
+        run: |
+          python -c 'import platform, tkinter; print(platform.machine(), tkinter.TkVersion); assert platform.machine() == "arm64"; assert tkinter.TkVersion >= 8.6'
 
       - name: Install dependencies
         run: |
@@ -30,7 +40,7 @@ jobs:
           python -m pip install -r requirements.txt numpy==1.26.4 pandas==2.2.3 scipy==1.14.1 matplotlib==3.9.2 statsmodels==0.14.4 seaborn==0.13.2 "pyinstaller>=6.11,<7" openpyxl xlrd
           python -m pip check
 
-      - name: Build portable Windows application
+      - name: Build macOS application
         shell: python
         run: |
           from pathlib import Path
@@ -41,13 +51,23 @@ jobs:
 
           launcher = textwrap.dedent(r'''
           import os
+          import shutil
           import sys
           import traceback
           from pathlib import Path
 
           def run():
               bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-              os.chdir(bundle_dir / "code")
+              # Keep writable preferences and logs outside the application bundle.
+              runtime = Path.home() / "Library/Application Support/Minijmp/runtime"
+              code_dir = runtime / "code"
+              code_dir.mkdir(parents=True, exist_ok=True)
+              for name in ("icon.png", "help.json"):
+                  shutil.copy2(bundle_dir / "code" / name, code_dir / name)
+              samples = runtime / "sample_data"
+              if not samples.exists():
+                  shutil.copytree(bundle_dir / "sample_data", samples)
+              os.chdir(code_dir)
               if sys.stdout is None:
                   sys.stdout = open(os.devnull, "w")
               if sys.stderr is None:
@@ -98,42 +118,45 @@ jobs:
               try:
                   run()
               except Exception:
-                  log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Minijmp"
+                  log_dir = Path.home() / "Library/Logs/Minijmp"
                   log_dir.mkdir(parents=True, exist_ok=True)
                   (log_dir / "startup-error.log").write_text(traceback.format_exc(), encoding="utf-8")
                   sys.exit(1)
           ''').lstrip()
-          Path("windows_launcher.py").write_text(launcher, encoding="utf-8")
+          Path("macos_launcher.py").write_text(launcher, encoding="utf-8")
 
           subprocess.run([
               sys.executable, "-m", "PyInstaller",
               "--noconfirm", "--clean", "--onedir", "--windowed",
               "--name", "Minijmp",
+              "--target-arch", "arm64",
+              "--osx-bundle-identifier", "org.minijmp.desktop",
               "--paths", "code",
-              "--add-data", "code/icon.png;code",
-              "--add-data", "code/help.json;code",
-              "--add-data", "sample_data;sample_data",
+              "--add-data", "code/icon.png:code",
+              "--add-data", "code/help.json:code",
+              "--add-data", "sample_data:sample_data",
               "--collect-all", "scipy",
               "--collect-all", "statsmodels",
               "--collect-all", "seaborn",
               "--collect-all", "openpyxl",
               "--hidden-import", "xlrd",
               "--hidden-import", "matplotlib.backends.backend_tkagg",
-              "windows_launcher.py",
+              "macos_launcher.py",
           ], check=True)
 
-          output = Path("dist/Minijmp")
+          output = Path("release/Minijmp-macOS-arm64")
+          output.mkdir(parents=True, exist_ok=True)
           for name in ("LICENSE", "README.md"):
               shutil.copy2(name, output / name)
           subprocess.run([
               "git", "archive", "--format=zip",
-              "--output=dist/Minijmp/source.zip", "HEAD",
+              "--output=release/Minijmp-macOS-arm64/source.zip", "HEAD",
           ], check=True)
-          (output / "README-Windows.txt").write_text(
-              "Extract the entire archive before opening Minijmp.exe.\n"
-              "Keep Minijmp.exe and the _internal directory together.\n"
+          (output / "README-macOS.txt").write_text(
+              "Extract Minijmp-macOS-arm64.zip, then open Minijmp.app.\n"
+              "This build is for Apple Silicon (M1/M2/M3/M4 or newer) on macOS 15 or later.\n"
               "Python is included. No separate Python installation is required.\n"
-              "Startup errors: %LOCALAPPDATA%\\Minijmp\\startup-error.log\n",
+              "Startup errors: ~/Library/Logs/Minijmp/startup-error.log\n",
               encoding="utf-8",
           )
           versions = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
@@ -142,23 +165,26 @@ jobs:
       - name: Verify packaged application
         shell: python
         run: |
-          import os
           from pathlib import Path
           import subprocess
 
-          executable = Path("dist/Minijmp/Minijmp.exe").resolve()
+          executable = Path("dist/Minijmp.app/Contents/MacOS/Minijmp").resolve()
           try:
               subprocess.run([str(executable), "--smoke-test"], check=True, timeout=120)
           except Exception:
-              log = Path(os.environ["LOCALAPPDATA"]) / "Minijmp/startup-error.log"
+              log = Path.home() / "Library/Logs/Minijmp/startup-error.log"
               if log.exists():
                   print(log.read_text(encoding="utf-8"))
               raise
 
-      - name: Upload Windows download
+      - name: Create macOS ZIP preserving permissions
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/Minijmp.app release/Minijmp-macOS-arm64/Minijmp-macOS-arm64.zip
+
+      - name: Upload macOS download
         uses: actions/upload-artifact@v4
         with:
-          name: Minijmp-Windows-x64
-          path: dist/Minijmp/
+          name: Minijmp-macOS-arm64
+          path: release/Minijmp-macOS-arm64/
           if-no-files-found: error
           retention-days: 14
